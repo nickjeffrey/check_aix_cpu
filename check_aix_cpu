@@ -1,0 +1,387 @@
+#!/usr/bin/perl -w
+
+
+
+# CHANGE LOG
+# ----------
+#  2009/03/09	Nick Jeffrey	Script created
+#  2011/10/04	Nick Jeffrey	Do not assume proc0 exists - it may have been removed via DLPAR
+#  2011/10/04	Nick Jeffrey	Add $verbose flag for debugging
+#  2011/10/04	Nick Jeffrey	Add percent sign to entc=??% portion of output
+#  2012/12/25   Nick Jeffrey    Add nagios perfdata to output
+
+
+
+#
+# Nagios plugin for checking AIX CPU utilization statistics
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+# 
+#  The line of output will become the body of the alert message sent by nagios
+#
+#  
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.  
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#      define service {
+#              use                             generic-24x7-service
+#              hostgroup_name                  all_aix
+#              service_description             AIX CPU
+#              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_aix_cpu
+#              }
+#
+#
+#  Alternatively, if you are using the NRPE method, you should have a section similar to the following in 
+#  the services.cfg file:
+#      define service{
+#               use                             generic-24x7-service
+#               hostgroup_name                  all_aix
+#               service_description             AIX CPU
+#               check_command                   check_nrpe!check_aix_cpu -t 30
+#               notification_options            c,r                     ; Send notifications about critical and recovery events
+#  If you are using the NRPE method, you will also need a command definition similar to the following on each monitored host
+#  in the /usr/local/nagios/nrpe/nrpe.cfg file:
+#      command[check_aix_cpu]=/usr/local/nagios/libexec/check_aix_cpu
+#
+#
+#
+#
+#  Please note that the default thresholds for alerting are as follows:
+#        WARN on iowait cpu utilization 50% or more
+#        CRIT on iowait cpu utilization 80% or more
+#        WARN on user   cpu utilization 75% or more
+#        CRIT on user   cpu utilization 90% or more
+#        WARN on sys    cpu utilization 75% or more
+#        CRIT on sys    cpu utilization 90% or more
+#        WARN on idle   cpu utilization 10% or less
+#        CRIT on idle   cpu utilization 5%  or less
+#        WARN on entitled cpu utilization 500% or more
+#        CRIT on entitled cpu utilization 800% or more
+
+ 
+
+use strict;						#enforce good coding practices
+
+
+# define variables
+my ($CHECK_NAME,$lsattr,$lsdev,$proc,$iostat,$iostat_interval,$iostat_repeats,$cpuspeed,$cputype,$lpar);
+my ($tin,$tout,$user,$sys,$idle,$iowait,$physc,$entc);
+my ($thresh_warn_iowait,$thresh_crit_iowait,$thresh_warn_user,$thresh_crit_user); 
+my ($thresh_warn_sys,$thresh_crit_sys,$thresh_warn_idle,$thresh_crit_idle,$common_output_data,$perf_data); 
+my ($thresh_warn_entc,$thresh_crit_entc,$verbose);
+my ($OK,$WARN,$CRITICAL,$UNKNOWN); 
+	
+
+#define name of nagios check
+$CHECK_NAME="AIX_CPU";					#define name of nagios check
+
+
+
+#
+# define variables
+#
+$lsattr              = "/usr/sbin/lsattr";		#location of lsattr binary
+$lsdev               = "/usr/sbin/lsdev";		#location of lsdev binary
+$iostat              = "/usr/bin/iostat";		#location of iostat binary
+$iostat_interval     = 1;				#seconds to wait between iostat checks
+$iostat_repeats      = 5;				#how many iostat checks to run
+$cpuspeed            = 0;				#speed of CPU (reported in hz, but we convert to Ghz)
+$cputype             = "";				#type of CPU (POWER5, POWER6, etc)
+$thresh_warn_iowait  = 50;				#default threshold for warning  on % iowait time
+$thresh_crit_iowait  = 80;				#default threshold for critical on % iowait time
+$thresh_warn_user    = 75;				#default threshold for warning  on % user   time
+$thresh_crit_user    = 90;				#default threshold for critical on % user   time
+$thresh_warn_sys     = 75;				#default threshold for warning  on % sys    time
+$thresh_crit_sys     = 90;				#default threshold for critical on % sys    time
+$thresh_warn_idle    = 10;				#default threshold for warning  on % idle   time
+$thresh_crit_idle    = 5;				#default threshold for critical on % idle   time
+$thresh_warn_entc    = 500;				#default threshold for warning  on % entitled CPU util
+$thresh_crit_entc    = 900;				#default threshold for critical on % entitled CPU util
+$tin                 = 0;				#initialize iostat counter for TTY characters in
+$tout                = 0;				#initialize iostat counter for TTY characters out
+$user                = 0;				#initialize iostat counter for %user CPU 
+$sys                 = 0;				#initialize iostat counter for %sys CPU
+$idle                = 0;				#initialize iostat counter for %idle CPU
+$iowait              = 0;				#initialize iostat counter for %iowait CPU
+$physc               = 0;				#initialize iostat counter for physical CPU consumed
+$entc                = 0;				#initialize iostat counter for %entitled CPU capacity consumed
+$lpar	             = "";				#flag to determine if AIX system is a micropartitioned LPAR
+$proc	             = "";				#hold value of /dev/proc#
+$verbose             = "no";				#yes/no flag to enable extra verbosity for debugging
+$common_output_data  = "";                              #nagios performance data included in output
+$perf_data           = "";                              #nagios performance data included in output
+
+
+#
+# Nagios return codes - this script returns a value to nagios for processing
+#
+$OK=0;
+$WARN=1;
+$CRITICAL=2;
+$UNKNOWN=3;
+
+
+
+sub check_prereqs {
+   #
+   print "Running check_prereqs subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm required files exist and are executable
+   #
+   if ( ! -e "$lsattr" ) {
+      print "$CHECK_NAME UKNOWN required file $lsattr not found \n";
+      exit $UNKNOWN; 
+   }
+   if ( ! -x "$lsattr" ) {
+      print "$CHECK_NAME UNKNOWN required file $lsattr is not executable by the nagios user \n";
+      exit $UNKNOWN;
+   } 
+   if ( ! -e "$lsdev" ) {
+      print "$CHECK_NAME UKNOWN required file $lsdev not found \n";
+      exit $UNKNOWN; 
+   }
+   if ( ! -x "$lsdev" ) {
+      print "$CHECK_NAME UNKNOWN required file $lsdev is not executable by the nagios user \n";
+      exit $UNKNOWN;
+   } 
+   if ( ! -e "$iostat" ) {
+      print "$CHECK_NAME UKNOWN required file $iostat not found \n";
+      exit $UNKNOWN; 
+   }
+   if ( ! -x "$iostat" ) {
+      print "$CHECK_NAME UNKNOWN required file $iostat is not executable by the nagios user \n";
+     exit $UNKNOWN;
+   } 
+}								#end of subroutine
+
+
+
+
+sub check_cpu_type {
+   #
+   print "Running check_cpu_type subroutine \n" if ($verbose eq "yes");
+   #
+   # figure out what proc# device exists
+   open (IN,"$lsdev |");                 			#open filehandle using command output
+   while (<IN>) {    						#read a line from the filehandle
+      if ( /^(proc[0-9]+) / ) {  				#look for processor device
+         $proc = $1;						#save name of processor device in a variable
+         print "Found $proc processor device \n" if ($verbose eq "yes");
+      }            						#end of if block
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   # Now that we know the processor device name, get the speed
+   #
+   open (IN,"$lsattr -El $proc |");                 		#open filehandle using command output
+   while (<IN>) {    						#read a line from the filehandle
+      #
+      # Get the CPU clock speed 
+      #
+      if ( /^frequency +([0-9]+)/ ) {  				#look for memory size
+         $cpuspeed = $1;					#save cpu clock speed in a variable
+         $cpuspeed = $cpuspeed / 1000000000;			#divide by a billion to convert hz to Ghz
+         $cpuspeed = sprintf("%.2f",$cpuspeed);			#truncate to 2 decimal places
+      }            						#end of if block
+      #
+      # Get the CPU type
+      #
+      if ( /^type +([a-zA-Z0-9_]+)/ ) { 			#look for CPU type
+         $cputype = $1;						#save cpu type in a variable
+      }            						#end of if block
+   }                        					#end of while loop
+   close IN; 							#close filehandle
+}								#end of subroutine
+
+
+
+
+sub check_cpu_util {
+   #
+   print "Running check_cpu_util subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # Get an average of CPU utiliation over a few seconds
+   #
+   # If the AIX server is an LPAR using micropartitioning, the output will look similar to:
+   #   System configuration: lcpu=4 ent=0.20
+   #
+   #   tty:      tin         tout    avg-cpu: % user % sys % idle % iowait physc % entc
+   #             0.0         37.6               33.0  63.9    2.8      0.3   0.5  249.4
+   #             0.0        164.8               40.1  58.5    1.4      0.0   0.7  357.6
+   #             0.0         82.0                1.2   4.5   94.3      0.0   0.0    8.1
+   #             0.0         82.0                1.8   4.4   93.7      0.0   0.0    8.7
+   #             0.0         82.2                4.0   4.0   92.0      0.0   0.0   10.3
+   #
+   # If the AIX server is not an LPAR (or is a full system partition), the output will look similar
+   # to the following.  Note that the physc and %entc columns are missing.
+   #   System configuration: lcpu=4
+   #
+   #   tty:      tin         tout    avg-cpu: % user % sys % idle % iowait
+   #             0.0         31.4                0.1   0.2   99.7      0.0
+   #             0.0        140.0                0.0   0.1   99.8      0.0
+   #             0.0         69.0                0.0   0.3   99.6      0.0
+   #             0.0         67.2                0.0   0.2   99.8      0.0
+   #             0.0         69.0                0.0   0.1   99.8      0.0
+   #
+   #   
+   #
+   # figure out if this machine is a micropartitioned LPAR with an entitled CPU capacity
+   open (IN,"$iostat -t $iostat_interval $iostat_repeats |");	#open filehandle using command output
+   while (<IN>) {                                               #read a line from the filehandle
+      $lpar="no"  if ( /System configuration: lcpu=[0-9]+$/); 
+      $lpar="yes" if ( /System configuration: lcpu=[0-9]+ ent=[0-9\.]+$/); 
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   open (IN,"$iostat -t $iostat_interval $iostat_repeats |");	#open filehandle using command output
+   while (<IN>) {                                               #read a line from the filehandle
+      #
+      if ( $lpar eq "no" ) {
+         #
+         # this regexp will be used if the machine is not an LPAR, or is a full system partition   
+         # This means the physc and %entc columns will not exist
+         if ( /([0-9]+\.[0-9]) +([0-9]+\.[0-9]) +([0-9]+\.[0-9]) +([0-9]+\.[0-9]) +([0-9]+\.[0-9]) +([0-9]+\.[0-9])$/ ) { 
+            $tin    = ($tin    + $1);  				#capture TTY characters in
+            $tout   = ($tout   + $2);        			#capture TTY characters out
+            $user   = ($user   + $3);        			#capture % user cpu
+            $sys    = ($sys    + $4);        			#capture % sys  cpu
+            $idle   = ($idle   + $5);        			#capture % idle cpu
+            $iowait = ($iowait + $6);        			#capture % cpu time waiting for i/o from disk or network
+         }							#end of if block
+      }								#end of if block
+      #
+      if ( $lpar eq "yes" ) {
+         #
+         # this regexp will be used if the machine is an LPAR using micropartitioning (ie has physc and %enc columns)
+         if ( /([0-9]+\.[0-9]) +([0-9]+\.[0-9]) +([0-9]+\.[0-9]) +([0-9]+\.[0-9]) +([0-9]+\.[0-9]) +([0-9]+\.[0-9]) +([0-9]+\.[0-9]) +([0-9]+\.[0-9])$/ ) { 
+            $tin    = ($tin    + $1);  				#capture TTY characters in
+            $tout   = ($tout   + $2);        			#capture TTY characters out
+            $user   = ($user   + $3);        			#capture % user cpu
+            $sys    = ($sys    + $4);        			#capture % sys  cpu
+            $idle   = ($idle   + $5);        			#capture % idle cpu
+            $iowait = ($iowait + $6);        			#capture % cpu time waiting for i/o from disk or network
+            $physc  = ($physc  + $7);        			#capture number of physical processors consumed
+            $entc   = ($entc   + $8);        			#capture % entitled CPU capacity consumed
+         }                                                      #end of if block
+      }								#end of if block 
+   }                                                            #end of while loop
+   close IN;                                                    #close filehandle
+   #
+   # Calculate average values
+   #
+   $tin    = ($tin    / $iostat_repeats);			
+   $tout   = ($tout   / $iostat_repeats);        	
+   $user   = ($user   / $iostat_repeats);        
+   $sys    = ($sys    / $iostat_repeats);   
+   $idle   = ($idle   / $iostat_repeats);  
+   $iowait = ($iowait / $iostat_repeats);     
+   $physc  = ($physc  / $iostat_repeats);    
+   $entc   = ($entc   / $iostat_repeats);   
+}								#end of subroutine
+
+
+
+
+
+
+sub print_output {
+   #
+   print "Running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
+   $perf_data = "user=${user}%;${thresh_warn_user}%;${thresh_crit_user}%;0%;100% sys=${sys}%;${thresh_warn_sys}%;${thresh_crit_sys}%;0%;100% idle=${idle}%;${thresh_warn_idle}%;${thresh_crit_idle}%;0%;100% iowait=${iowait}%;$thresh_warn_iowait}%;${thresh_crit_iowait}%;0%;100% physc=${physc};;;; entc=${entc}%;${thresh_warn_entc}%;${thresh_crit_entc}%;0;";
+   #
+   #
+   #
+   # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
+   $common_output_data = "user=${user}% sys=${sys}% idle=${idle}% iowait=${iowait}% physc=$physc entc=${entc}% CPUspeed=${cpuspeed}Ghz CPUtype=$cputype";
+   #
+
+
+   # Send an alert for excessive iowait
+   #
+   if ( $iowait > $thresh_crit_iowait ) {
+      print "$CHECK_NAME CRITICAL - Excessive iowait times.  The CPU is sitting idle while waiting for I/O from the disk or network.  This can be indicative of a bottleneck.  Try running the iostat or topas commands to see if you are maxing out the disk. $common_output_data  | $perf_data \n";
+      exit $CRITICAL;						#exit script
+   }
+   if ( $iowait > $thresh_warn_iowait ) {
+      print "$CHECK_NAME WARN - Excessive iowait times.  The CPU is sitting idle while waiting for I/O from the disk or network.  This can be indicative of a bottleneck.  Try running the iostat or topas commands to see if you are maxing out the disk. $common_output_data  | $perf_data \n";
+      exit $WARN;						#exit script
+   }								 
+   #
+   # Send an alert for excessive user cpu util
+   #
+   if ( $user > $thresh_crit_user ) {
+      print "$CHECK_NAME CRITICAL - Excessive user CPU activity.  There are one or more processes consuming excessive user CPU cycles.  This may be indicative of a transient high workload, or there might be a runaway process.  Try running the iostat or topas commands to see if you can track down the offending process. $common_output_data  | $perf_data \n";
+      exit $CRITICAL;						#exit script
+   }
+   if ( $user > $thresh_warn_user ) {
+      print "$CHECK_NAME WARN - Excessive user CPU activity.  There are one or more processes consuming excessive user CPU cycles.  This may be indicative of a transient high workload, or there might be a runaway process.  Try running the iostat or topas commands to see if you can track down the offending process. $common_output_data  | $perf_data \n";
+      exit $WARN;						#exit script
+   }								 
+   #
+   # Send an alert for excessive kernel cpu util
+   #
+   if ( $sys > $thresh_crit_sys ) {
+      print "$CHECK_NAME CRITICAL - Excessive kernel CPU activity.  There are one or more processes consuming excessive user CPU cycles.  This may be indicative of a transient high workload, or there might be a runaway process.  Try running the iostat or topas commands to see if you can track down the offending process. $common_output_data  | $perf_data   \n";
+      exit $CRITICAL;						#exit script
+   }
+   if ( $sys > $thresh_warn_sys ) {
+      print "$CHECK_NAME WARN - Excessive kernel CPU activity.  There are one or more processes consuming excessive user CPU cycles.  This may be indicative of a transient high workload, or there might be a runaway process.  Try running the iostat or topas commands to see if you can track down the offending process. $common_output_data  | $perf_data \n";
+      exit $WARN;						#exit script
+   }								 
+   #
+   # Send an alert if idle CPU is too low
+   # This catches problems when user=50% and sys=50%, adding up to 100% cpu util
+   #
+   if ( $idle < $thresh_crit_idle ) {
+      print "$CHECK_NAME CRITICAL - Excessive CPU activity.  There are one or more processes consuming excessive user CPU cycles.  This may be indicative of a transient high workload, or there might be a runaway process.  Try running the iostat or topas commands to see if you can track down the offending process. $common_output_data  | $perf_data \n";
+      exit $CRITICAL;						#exit script
+   }
+   if ( $idle < $thresh_warn_idle ) {
+      print "$CHECK_NAME WARN - Excessive CPU activity.  There are one or more processes consuming excessive user CPU cycles.  This may be indicative of a transient high workload, or there might be a runaway process.  Try running the iostat or topas commands to see if you can track down the offending process. $common_output_data  | $perf_data \n";
+      exit $WARN;						#exit script
+   }								 
+   #
+   # Send an alert if using far in excess of entitled CPU allocation.  
+   # We do not send critical alerts for this because the machine is still running fine, 
+   # it just may need to have its desired CPU allocation set at a more realistic value.
+   #
+   if ( $entc > $thresh_crit_entc ) {
+      print "$CHECK_NAME CRITICAL - Exceeding entitled CPU capacity.  This machine is using $entc % of its entitled CPU capacity.  If this machine is running a valid workload, you may wish to give it a higher desired CPU allocation.  Try running the iostat or topas commands to see if you can get a good feel for the workload. $common_output_data  | $perf_data \n";
+      exit $WARN;						#exit script
+   }								 
+   #
+   if ( $entc > $thresh_warn_entc ) {
+      print "$CHECK_NAME WARN - Exceeding entitled CPU capacity.  This machine is using $entc % of its entitled CPU capacity.  If this machine is running a valid workload, you may wish to give it a higher desired CPU allocation.  Try running the iostat or topas commands to see if you can get a good feel for the workload. $common_output_data  | $perf_data \n";
+      exit $WARN;						#exit script
+   }								 
+   #
+   # if we get this far, it means that no problems were detected
+   #
+   print "$CHECK_NAME OK - $common_output_data  | $perf_data \n";
+   exit $OK;
+}								#end of subroutine
+
+
+
+
+
+# ----------------- main body of program --------------------------------
+check_prereqs;
+check_cpu_type;
+check_cpu_util;
+print_output;
