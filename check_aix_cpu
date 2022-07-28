@@ -9,6 +9,7 @@
 #  2011/10/04	Nick Jeffrey	Add $verbose flag for debugging
 #  2011/10/04	Nick Jeffrey	Add percent sign to entc=??% portion of output
 #  2012/12/25   Nick Jeffrey    Add nagios perfdata to output
+#  2022/07/28   Nick Jeffrey    Tweak perfdata output
 
 
 
@@ -304,7 +305,8 @@ sub print_output {
    # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
    # You can have multiple items of perf data, just separate each section with a space
    # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
-   $perf_data = "user=${user}%;${thresh_warn_user}%;${thresh_crit_user}%;0%;100% sys=${sys}%;${thresh_warn_sys}%;${thresh_crit_sys}%;0%;100% idle=${idle}%;${thresh_warn_idle}%;${thresh_crit_idle}%;0%;100% iowait=${iowait}%;$thresh_warn_iowait}%;${thresh_crit_iowait}%;0%;100% physc=${physc};;;; entc=${entc}%;${thresh_warn_entc}%;${thresh_crit_entc}%;0;";
+   #$perf_data = "user=${user}%;${thresh_warn_user}%;${thresh_crit_user}%;0%;100% sys=${sys}%;${thresh_warn_sys}%;${thresh_crit_sys}%;0%;100% idle=${idle}%;${thresh_warn_idle}%;${thresh_crit_idle}%;0%;100% iowait=${iowait}%;$thresh_warn_iowait}%;${thresh_crit_iowait}%;0%;100% physc=${physc};;;; entc=${entc}%;${thresh_warn_entc}%;${thresh_crit_entc}%;0;";
+   $perf_data = "user=${user}%;;;; sys=${sys}%;;;; idle=${idle}%;;;; iowait=${iowait}%;;;; physc=${physc};;;; entc=${entc}%;;;;";
    #
    #
    #
